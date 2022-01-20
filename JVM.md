@@ -188,7 +188,154 @@
 - 对CPU资源敏感（GC线程与用户线程抢占CPU）
 - 产生浮动垃圾
 
+#### G1
 
+![image](https://image-static.segmentfault.com/763/689/763689472-5eaea0b470880)
+
+##### 相关概念
+
+**Region（分区）**
+
+G1将整个堆空间分成若干个大小相等的内存区域，新生代和老年代不再物理隔离，每个小空间都可以单独进行垃圾回收。
+
+![image](https://pdai.tech/_images/pics/9bbddeeb-e939-41f0-8e8e-2b1a0aa7e0a7.png)
+
+**LAB**
+
+每个线程都可以认领一个Region用于线程本地的内存分配，进而减少同步时间，提升GC效率，这个Region称为本地分配缓冲区（LAB）
+
+- 应用线程本地缓冲区（TLAB）：每个线程独占的LAB，位于eden区
+- GC线程本地缓冲区（GCLAB）：GC时GC线程独占的LAB，用来将对象**复制**到survivor区或老年代
+- 晋升本地缓冲区（PLAB）：GC时GC线程独占的LAB，用来将eden/survivor的对象**晋升**到survivor区/老年代
+
+**Humongous Object（巨型对象）**
+
+一个大小达到或超过Region 50%对象称为巨型对象，其会占用一个或多个连续的分区，巨型对象直接分配在老年代，防止反复拷贝移动。
+
+**Card（卡片）**
+
+在每个Region内部又被分成若干个512 Byte的卡片，标识堆内存使用的最小粒度，所有Region的Card都记录在全局卡表（Global Card Table）中，当查找Region中的对象时，便可根据记录卡片来进行查找，每次对内存的回收，都是对指定Region的Card进行回收。
+
+**RSet（Remember Set 已记忆集合）**
+
+每个Region内都保存了一个RSet，里面记录了引用该Region内对象的Card索引，当要回收某个Region时，通过扫描该Region的RSet，来确定**引用**该分区的对象是否存活，进而确定该分区的对象是否存活（类似于从GC Root向下扫描）。
+
+>  如Region A Card 1中的X对象引用了Region B Card 1中的Y对象，则Region B中的RSet记录了Region A Card 1的索引。当要回收Region B时，扫描Region B的RSet，先去确认Region A Card 1 X对象是否存活，进而确认Region B Card 1 Y对象是否存活。
+
+由于G1每次GC时都会对年轻代进行整体收集，所以年轻代中的对象引用不需要记录在RSet中，因此年轻代和老年代Region中的RSet只记录了来自老年代的引用（记录的引用关系old -> old，old -> young）。
+
+>  因为RSet中记录了引用关系，所以在GC时，不需要扫描全部老年代（老年代中只需要扫描引用了对象的Region），从而减少了GC的工作量。
+
+**Per Region Table（PRT）**
+
+RSet内部使用PRT记录Region的引用情况，引用越多，RSet占用的空间也越大，为此G1中的PRT有三种不同的数据结构：
+
+- 稀疏表：hash表存储，key为Region的索引，value为引用Card的索引数组
+- 细粒度：位图，每一位对应一个Card索引
+- 粗粒度：位图，每一位对应一个Region索引
+
+**CSet（Collection Set 收集集合）**
+
+CSet代表每次GC需要收集的目标Region，每次GC都会释放CSet内记录的所有Region，存活的对象转移到其他空闲Region。
+
+YGC（年轻代收集）时CSet只容纳年轻代分区，Mixed GC（混合收集）会在老年代中筛选出回收收益最高的Region加入到CSet中。
+
+YGC和Mixed GC工作机制是一样的。
+
+##### 回收机制
+
+**年轻代收集**
+
+- 当JVM在Eden区分配内存失败或Eden区已满，则触发一次YGC，STW
+- 所有的年轻代Region都会被扫描，故所有的年轻代Region都会加入到CSet中
+- Eden区的活对象拷贝到Survivor区中，原有Survivor区中的活对象根据年龄拷贝到新的Survivor区或晋升到老年代分区
+
+**混合收集**
+
+当YGC不断活动，老年代的空间也逐渐填充，当老年代占用堆空间达到阈值（默认45%）时，则会触发并发标记周期（Concurrent Marking Cycle），并发标记周期包含以下步骤，类似于CMS：
+
+- 初始标记（Initial Marking），标记GC Roots，这一阶段在YGC的STW时间段完成，STW
+
+> 标记GC Roots
+
+- 根分区扫描（Root region scanning），初始标记结束后，YGC也完成了活对象的复制工作，此阶段在初始标记的存活区扫描对老年代的引用，并标记被引用的对象，该阶段与应用程序同时运行，并且只有完成该阶段后，才能开始下一次 STW 年轻代垃圾回收，非STW
+
+> 标记老年代中的GC Roots
+
+- 并发标记（Concurrent Marking），在整个堆中查找可访问的（存活的）对象，该阶段与应用程序同时运行，可以被 STW 年轻代垃圾回收中断。
+
+> 标记活对象
+
+- 最终标记（Remark），标记那些在并发标记阶段发生变化的对象，这一步跟CMS类似，标记那些未被标记到的活对象，STW
+
+> 处理并发标记阶段发生变化的对象（不可达变为可达的对象）
+
+- 清除（Cleanup），清理CSet中的Region
+
+> 清理
+
+并发标记周期内会将部分老年代分区加入到CSet中，选择老年代分区的策略是垃圾多的优先（回收收益高），YGC只回收老年代，Mixed GC会回收年轻代和部分老年代，所以叫混合收集。
+
+**并发标记阶段使用的算法**
+
+**三色标记法**
+
+黑色：自身和成员变量都已经被GC Roots扫描过
+
+灰色：自身被GC Roots扫描过，但成员变量还没有扫描完
+
+白色：没有被GC Roots扫描过，可能是垃圾对象
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20210413211838241.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2FzZDEzNTE4NjYy,size_16,color_FFFFFF,t_70#pic_center)
+
+>  标记步骤：
+>
+>  - 初始阶段，所有对象都是白色
+>
+>  ![img](https://upload-images.jianshu.io/upload_images/25147367-724c9cf42d90868a.png?imageMogr2/auto-orient/strip|imageView2/2/w/862/format/webp)
+>
+>  - 初始标记阶段，GC Roots关联的对象标记为灰色
+>
+>  ![img](https://upload-images.jianshu.io/upload_images/25147367-cd0326508352d6b0.png?imageMogr2/auto-orient/strip|imageView2/2/w/900/format/webp)
+>
+>  - 并发标记阶段，继续向下扫描，自身和成员变量扫描完成的标记为黑色，否则为灰色
+>
+>  ![img](https://upload-images.jianshu.io/upload_images/25147367-bd9793c6595075c9.png?imageMogr2/auto-orient/strip|imageView2/2/w/870/format/webp)
+
+三色标记法保证了在遍历完对象树之后，所有被标记上颜色（黑/灰）的对象，都是活对象，但是由于并发阶段GC线程与用户线程是同时运行的，可能会出现多标或漏标的情况
+
+- 多标，上图如果在扫描完C -> E之后，C中的属性变化为C.E = null，断开了C -> E的引用，但GC线程此时已经扫描C结束，认为E是可达对象，则出现E多标的情况，可达对象变为不可达，即产生了浮动垃圾E，E在这次的GC中无法回收，需要在下一次GC中处理
+- 漏标，上图C中的属性变化为C.E = null，随后GC线程扫描到C，认为E为不可达对象，但随后B -> E，则出现E漏标的情况，这种情况必须要修正，否则E会被错误回收
+
+**CMS处理漏标**
+
+**Incremental update（增量更新）**
+
+增加了新引用的对象会被重新标记为灰色，在重新标记（remark）阶段对其重新进行扫描，上面的例子会将B标记为灰色，然后从B开始向下重新开始扫描，这种方式效率不高，因为一个引用需要将整个引用链重新扫描。
+
+**G1处理漏标**
+
+**SATB（Snapshot At The Beginning）**
+
+- 在GC开始时对堆做一次快照，生成一个所有对象的快照图
+- 并发标记阶段，如果发生了引用更新，则将这个更新推送到一个标记栈内
+- 在最终标记阶段，对这个栈内的所有引用进行扫描
+
+由于有RSet存在，所以重新扫描引用时，只需要扫描对象的RSet就能知道其被引用的情况，而不需要扫描整个堆
+
+**Full GC**
+
+当混合回收无法跟上内存分配的速度，导致老年代也满了，就会进行Full GC对整个堆进行回收。G1中的Full GC也是单线程串行的，而且是STW，使用的是标记-整理算法，代价非常高。
+
+**优势**
+
+- **空间整合**，对比CMS的标记-清除算法，G1使用的是标记-整理算法
+- **可预测的停顿**，用户可以指定GC的最大停顿时间，GC时的停顿时间不会超过该值（不完全保证）
+
+**缺点**
+
+- 仍然会产生浮动垃圾
+- GC时的内存占用和CPU负载都比CMS要高
 
 ## 类加载
 
